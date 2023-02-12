@@ -1,5 +1,11 @@
 import os
 import requests
+import slack
+from flask import Flask
+from slackeventsapi import SlackEventAdapter
+
+from threading import Thread
+from queue import Queue, Full
 from langchain.agents import Tool
 from langchain.agents import load_tools
 from langchain.agents import initialize_agent
@@ -7,7 +13,12 @@ from langchain.llms import OpenAI
 from langchain.prompts import PromptTemplate
 
 # from extractor_api import ExtractorAPI
+# from ai import AI
+# from database_access import sql_query
 
+SLACK_CHANNEL = os.environ.get('SLACK_CHANNEL')
+SLACK_TOKEN = os.environ.get('SLACK_TOKEN')
+SLACK_SIGNING_TOKEN = os.environ.get('SLACK_SIGNING_TOKEN')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 SERPAPI_API_KEY = os.environ.get('SERPAPI_API_KEY')
 WOLFRAM_ALPHA_APPID = os.environ.get('WOLFRAM_ALPHA_APPID')
@@ -65,5 +76,64 @@ class ExtractorAPI:
             return f"Error: {e}. Is the URL valid?"
 
 
+app = Flask(__name__)
+slack_event_adapter = SlackEventAdapter(SLACK_SIGNING_TOKEN, '/slack/events', app)
+
+client = slack.WebClient(token=SLACK_TOKEN)
+
 ai = AI()
-print(ai.run("Mitä ravintoloita ostoskeskus Redissä on?"))
+messages_to_handle = Queue(maxsize=32)
+
+
+def reply_to_slack(thread_ts, response):
+    client.chat_postMessage(channel=SLACK_CHANNEL, text=response, thread_ts=thread_ts)
+
+
+def confirm_message_received(channel, thread_ts):
+    client.reactions_add(
+        channel=channel,
+        name="thumbsup",
+        timestamp=thread_ts
+    )
+
+
+def handle_message():
+    while True:
+        message_id, thread_ts, user_id, text = messages_to_handle.get()
+        print(f'Handling message {message_id} with text {text}')
+        text = " ".join(text.split(" ", 1)[1:])
+        try:
+            response = ai.run(text)
+            reply_to_slack(thread_ts, response)
+        except Exception as e:
+            response = f":exclamation::exclamation::exclamation: Error: {e}"
+            reply_to_slack(thread_ts, response)
+        finally:
+            messages_to_handle.task_done()
+
+
+@slack_event_adapter.on('app_mention')
+def message(payload):
+    print(payload)
+    event = payload.get('event', {})
+    message_id = event.get('client_msg_id')
+    thread_ts = event.get('ts')
+    channel = event.get('channel')
+    user_id = event.get('user')
+    text = event.get('text')
+    try:
+        messages_to_handle.put_nowait((message_id, thread_ts, user_id, text))
+        confirm_message_received(channel, thread_ts)
+    except Full:
+        response = f":exclamation::exclamation::exclamation:Error: Too many requests"
+        reply_to_slack(thread_ts, response)
+    except Exception as e:
+        response = f":exclamation::exclamation::exclamation: Error: {e}"
+        reply_to_slack(thread_ts, response)
+        print(e)
+
+
+if __name__ == "__main__":
+    Thread(target=handle_message, daemon=True).start()
+    app.run(port=5002, debug=True)
+
